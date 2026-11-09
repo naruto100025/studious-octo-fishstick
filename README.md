@@ -98,7 +98,7 @@
 %global xmlPath;
 
 %macro goaml_xml_name;
-    %local case_id report_type http_rc export_user att_rc xml_count max_ver;
+    %local case_id report_type http_rc export_user att_rc xml_count max_ver dsid has_name rc;
 
     %let xmlPath = &filePath.&fileName;
     %if %sysfunc(fileexist(&xmlPath)) = 0 %then %do;
@@ -168,12 +168,22 @@
     %if &att_rc = 200 %then %do;
         libname _rratt json fileref=_rratt;
         %if %sysfunc(libref(_rratt)) = 0 %then %do;
-            %if %sysfunc(exist(_rratt.items)) %then %do;
+            /* With no attachments, the ITEMS table is missing or has no NAME column - check before reading */
+            %let dsid = 0;
+            %let has_name = 0;
+            %if %sysfunc(exist(_rratt.items)) %then %let dsid = %sysfunc(open(_rratt.items));
+            %if &dsid > 0 %then %do;
+                %let has_name = %sysfunc(varnum(&dsid, name));
+                %let rc = %sysfunc(close(&dsid));
+            %end;
+
+            %if &has_name > 0 %then %do;
                 data _rr_att_names;
                     length name $512;
                     set _rratt.items(keep=name);
                 run;
             %end;
+            %else %put NOTE: No attachments on report &report_id - this export is V1.;
             libname _rratt clear;
         %end;
     %end;
