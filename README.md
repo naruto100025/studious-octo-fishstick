@@ -85,21 +85,24 @@
 %include "&SAS_CUST_ROOT/programs/aml_generate_xml.sas";
 
 
-/* 1b. Rename the XML to: ReportType_ReportID_CaseID_ExportUser_V#.xml
-       e.g. STR_RR2026_100047_202610158_noor.khaled_V1.xml
-       ExportUser = the user who clicked Export XML.
-       V# counts up per report: V1 on the first export, V2 on the next, ...
-       The new name is used for the saved file, the SVI attachment and the download. */
-
-/* Column in sar.rr_report that holds the case ID.
-   The first name in the list that exists in sar.rr_report is used. */
-%let case_id_columns = cases_id case_id;
+/* 1b. Name the XML: ReportType_RRYear_CaseID_ExportUser_V#.xml
+       e.g. STR_RR2026_202610158_noor.khaled_V1.xml
+       RRYear     = report ID up to the first underscore (RR2026_100047 -> RR2026)
+       CaseID     = sar.rr_report.cases_id
+       ExportUser = the user who clicked Export XML
+       V#         = counts up per report: V1 on the first export, V2 on the next, ...
+                    (worked out from the XML files already attached to the report)
+       The name is used for the SVI attachment and the download.
+       The file saved in the xml folder keeps its original unique name (&xmlPath),
+       because the new name is not unique across reports of the same case.        */
+%global xmlPath;
 
 %macro goaml_xml_name;
-    %local dsid rc case_col case_id report_type i col http_rc export_user;
+    %local case_id report_type http_rc export_user att_rc xml_count max_ver;
 
-    %if %sysfunc(fileexist(&filePath.&fileName)) = 0 %then %do;
-        %put WARNING: XML file &filePath.&fileName not found - file name not changed.;
+    %let xmlPath = &filePath.&fileName;
+    %if %sysfunc(fileexist(&xmlPath)) = 0 %then %do;
+        %put WARNING: XML file &xmlPath not found - file name not changed.;
         %return;
     %end;
 
@@ -108,25 +111,13 @@
     %if "&report_code_id" = "FFR_SAR" or "&report_code_id" = "FFR_STR" %then %let report_type = FFR;
     %else %if "&report_code_id" = "PNMR_SAR" or "&report_code_id" = "PNMR_STR" %then %let report_type = PNMRA;
 
-    /* Find the case ID column in sar.rr_report */
-    %let dsid = %sysfunc(open(sar.rr_report));
-    %if &dsid > 0 %then %do;
-        %do i = 1 %to %sysfunc(countw(&case_id_columns));
-            %let col = %scan(&case_id_columns, &i);
-            %if %length(&case_col) = 0 and %sysfunc(varnum(&dsid, &col)) > 0 %then %let case_col = &col;
-        %end;
-        %let rc = %sysfunc(close(&dsid));
-    %end;
-
-    %if %length(&case_col) = 0 %then
-        %put WARNING: None of the columns (&case_id_columns) exist in sar.rr_report - case ID set to NOCASE.;
-
+    /* Case ID */
     proc sql noprint;
-        select %if %length(&case_col) %then cats(&case_col); %else ' ';
-        into :case_id trimmed
+        select cats(cases_id) into :case_id trimmed
         from sar.rr_report
         where rr_report_id = "&report_id";
     quit;
+    %if %length(&case_id) = 0 %then %put WARNING: cases_id is empty for &report_id - case ID set to NOCASE.;
 
     /* Export user: ask Viya who is running this job (can't be changed from the browser) */
     %let http_rc = 0;
@@ -157,11 +148,54 @@
         %put WARNING: Could not get the current user from Viya (HTTP &http_rc) - using current_user sent by the control.;
     %else %put WARNING: No current user available - user set to NOUSER.;
 
+    /* Versions already used: XML files attached to this report (this export is not attached yet) */
+    %let xml_count = 0;
+    %let max_ver   = 0;
+    %let att_rc    = 0;
+    filename _rratt temp;
+    proc http url="&serverNm/svi-datahub/documents/rr_report/&report_id/attachments?limit=1000" proxyhost=""
+        out=_rratt
+        method="get"
+        oauth_bearer=sas_services;
+        headers "Accept"="application/json";
+    quit;
+    %if %symexist(SYS_PROCHTTP_STATUS_CODE) %then %let att_rc = &SYS_PROCHTTP_STATUS_CODE;
+
+    data _rr_att_names;
+        length name $512;
+        stop;
+    run;
+    %if &att_rc = 200 %then %do;
+        libname _rratt json fileref=_rratt;
+        %if %sysfunc(libref(_rratt)) = 0 %then %do;
+            %if %sysfunc(exist(_rratt.items)) %then %do;
+                data _rr_att_names;
+                    length name $512;
+                    set _rratt.items(keep=name);
+                run;
+            %end;
+            libname _rratt clear;
+        %end;
+    %end;
+    %else %put WARNING: Could not read the report attachments (HTTP &att_rc) - version set to V1.;
+    filename _rratt clear;
+
+    proc sql noprint;
+        select count(*),
+               coalesce(max(case when prxmatch('/_V\d+\.xml$/i', strip(name))
+                                 then input(prxchange('s/^.*_V(\d+)\.xml$/$1/i', 1, strip(name)), 8.)
+                                 else 0 end), 0)
+          into :xml_count trimmed, :max_ver trimmed
+        from _rr_att_names
+        where prxmatch('/\.xml$/i', strip(name)) > 0;
+    quit;
+    %put NOTE: XML attachments on report = &xml_count, highest version used = V&max_ver;
+
     data _null_;
-        length fname $512 rid type casepart userraw userpart newname $256 oldpath newpath $1024;
+        length rryear type casepart userraw userpart newname $256;
 
         /* Keep each part file-name safe: characters not allowed in file names and spaces become _ */
-        rid      = strip(symget('report_id'));
+        rryear   = scan(strip(symget('report_id')), 1, '_');
         type     = prxchange('s/[\\\/:*?"<>|\s]+/_/', -1, strip(symget('report_type')));
         casepart = prxchange('s/[\\\/:*?"<>|\s]+/_/', -1, strip(symget('case_id')));
         userraw  = strip(symget('export_user'));
@@ -170,33 +204,16 @@
         if casepart = '' then casepart = 'NOCASE';
         if userpart = '' then userpart = 'NOUSER';
 
-        /* Next version = highest existing _V# for this report in the xml folder + 1 */
-        max_ver = 0;
-        rc  = filename('xmldir', strip(symget('filePath')));
-        did = dopen('xmldir');
-        if did > 0 then do;
-            do i = 1 to dnum(did);
-                fname = dread(did, i);
-                if find(fname, cats('_', rid, '_'), 'it') > 0
-                   and prxmatch('/_V\d+\.xml$/i', strip(fname)) then
-                    max_ver = max(max_ver, input(prxchange('s/^.*_V(\d+)\.xml$/$1/i', 1, strip(fname)), 8.));
-            end;
-            rc = dclose(did);
-        end;
-        rc = filename('xmldir');
+        /* This export's version: one more than the XML files already attached,
+           and never lower than the highest V# already used + 1 */
+        version = max(input(symget('xml_count'), 8.), input(symget('max_ver'), 8.)) + 1;
 
-        newname = cats(catx('_', type, rid, casepart, userpart, cats('V', max_ver + 1)), '.xml');
-        oldpath = cats(symget('filePath'), symget('fileName'));
-        newpath = cats(symget('filePath'), newname);
-
-        rc = rename(oldpath, newpath, 'file');
-        if rc = 0 then do;
-            call symputx('fileName', newname, 'G');
-            put 'NOTE: XML file renamed to ' newname;
-        end;
-        else put 'WARNING: Could not rename XML file to ' newname ' - keeping ' oldpath;
+        newname = cats(catx('_', type, rryear, casepart, userpart, cats('V', version)), '.xml');
+        call symputx('fileName', newname, 'G');
+        put 'NOTE: XML name for attachment and download: ' newname;
     run;
 
+    %put NOTE: xmlPath=&xmlPath;
     %put NOTE: fileName=&fileName;
 %mend goaml_xml_name;
 
@@ -244,7 +261,7 @@ run;
 
 filename respons temp;
 
-filename upFileN "&filePath.&fileName";
+filename upFileN "&xmlPath";   /* saved file on disk; it is named &fileName in SVI */
 proc http url="&serverNm/files/files?parentFolderUri=&fileUUID" proxyhost=""
   in=upFileN
   out=respons
@@ -265,7 +282,7 @@ quit;
 
 /* 5. Get File Service Details */
 libname step2 json (respons);
-%FileAttribs(&filePath.&fileName);
+%FileAttribs(&xmlPath);
 data _null_;
 	set step2.root;
 	call symput("fileId", id);
@@ -312,12 +329,12 @@ proc http url="&serverNm/svi-datahub/documents/rr_report/&report_id/attachments"
 quit;
 
 
-/* 7. Return the XML to the browser with its original file name */
- filename xml "&FILEPATH./&fileName";
+/* 7. Return the XML to the browser, named &fileName */
+ filename xml "&xmlPath";
 
-%put "&FILEPATH./&fileName";
+%put "&xmlPath";
 
-/* Send the XML as a download named exactly &fileName (e.g. RR2025_10005_20250929_062040.xml).
+/* Send the XML as a download named exactly &fileName (e.g. STR_RR2026_202610158_noor.khaled_V1.xml).
    name= must stay "_webout.xml" so the job streams the result back to the custom control. */
 filename _webout filesrvc parenturi="&SYS_JES_JOB_URI"
   name="_webout.xml"
